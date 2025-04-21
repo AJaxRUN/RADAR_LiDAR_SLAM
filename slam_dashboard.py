@@ -34,7 +34,7 @@ def update_graph(n):
     imu_traj = np.array(imu_trajectory) if imu_trajectory else np.zeros((0, 3))
     imu_traj_trace = go.Scatter3d(
         x=imu_traj[:, 0], y=imu_traj[:, 1], z=imu_traj[:, 2],
-        mode="lines+markers", marker=dict(size=2, color="black"),
+        mode="lines+markers", marker=dict(size=2, color="red"),
         name="IMU Trajectory"
     )
     lidar_trace = go.Scatter3d(
@@ -47,16 +47,16 @@ def update_graph(n):
         mode="markers", marker=dict(size=1, color="green"),
         name="RADAR"
     )
-    traj_trace = go.Scatter3d(
-        x=traj[:, 0], y=traj[:, 1], z=traj[:, 2],
-        mode="lines+markers", marker=dict(size=2, color="red"),
-        name="Trajectory"
-    )
+    # traj_trace = go.Scatter3d(
+    #     x=traj[:, 0], y=traj[:, 1], z=traj[:, 2],
+    #     mode="lines+markers", marker=dict(size=2, color="red"),
+    #     name="Trajectory"
+    # )
     layout = go.Layout(
         margin=dict(l=0, r=0, b=0, t=0),
         scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z")
     )
-    return go.Figure(data=[lidar_trace, radar_trace, traj_trace, imu_traj_trace], layout=layout)
+    return go.Figure(data=[lidar_trace, radar_trace, imu_traj_trace], layout=layout)
 
 @app.callback(
     Output("camera-view", "src"),

@@ -10,16 +10,14 @@ import os
 import open3d as o3d
 
 
+imu_trajectory = []
 camera_image = {'data': None}
+# Standard deviation of simulated IMU noise
+pos_noise_std = 0.2
 
 lidar_map_points = []
 radar_map_points = []
 trajectory = []
-
-imu_trajectory = []
-imu_velocity = np.zeros(3)
-imu_position = np.zeros(3)
-last_imu_time = [None] 
 
 def carla_slam_loop():
     global trajectory
@@ -99,74 +97,50 @@ def carla_slam_loop():
     radar3_tf = carla.Transform(carla.Location(x=1.0, y=-0.5, z=2.0))  # Same Y
     radar3 = world.spawn_actor(radar_bp, radar3_tf, attach_to=vehicle)
 
-    # IMU Sensor
-    imu_bp = bp_lib.find("sensor.other.imu")
-    imu_bp.set_attribute("sensor_tick", "0.05")  # 20 Hz
-    imu_tf = carla.Transform(carla.Location(x=0.0, y=0.0, z=2.5))  # Centered
-    imu_sensor = world.spawn_actor(imu_bp, imu_tf, attach_to=vehicle)
+    spectator = world.get_spectator()
+    def follow_vehicle():
+        prev_location = None
 
-    stationary_counter = 0
-    ZUPT_COUNT_THRESHOLD = 5 
+        while True:
+            transform = vehicle.get_transform()
+            forward = transform.get_forward_vector()
+            right = transform.get_right_vector()
+            up = transform.get_up_vector()
 
-    def imu_cb(imu_data):
-        global imu_trajectory, imu_velocity, imu_position, last_imu_time, stationary_counter
+            # Offset camera from vehicle
+            dx, dy, dz = -6, 0, 3
+            target_loc = transform.location + forward * dx + right * dy + up * dz
 
-        # --- Config ---
-        ACC_SCALE = 1
-        GRAVITY = np.array([0.0, 0.0, 9.8])
-        ACC_NOISE_THRESH = 0.2         # m/s²
-        VEL_ZUPT_THRESH = 0.05         # m/s
-        MAX_VELOCITY = 50.0            # sanity clamp
-        ZUPT_COUNT_THRESH = 5
-        MAX_DT = 0.1
+            # Smooth interpolation
+            if prev_location is None:
+                smoothed_loc = target_loc
+            else:
+                alpha = 0.1  # smoothing factor (0 = frozen, 1 = instant jump)
+                smoothed_loc = prev_location * (1 - alpha) + target_loc * alpha
 
-        if last_imu_time[0] is None:
-            last_imu_time[0] = imu_data.timestamp
-            return
+            prev_location = smoothed_loc
 
-        dt = imu_data.timestamp - last_imu_time[0]
-        if dt <= 0 or dt > MAX_DT:
-            imu_velocity[:] = 0.0
-            stationary_counter = 0
-            last_imu_time[0] = imu_data.timestamp
-            return
-        last_imu_time[0] = imu_data.timestamp
+            # Rotation: match yaw, slight downward pitch
+            cam_rotation = carla.Rotation(
+                pitch=-15.0,
+                yaw=transform.rotation.yaw,
+                roll=0.0
+            )
 
-        # --- Raw Accel (scale + gravity removal) ---
-        accel = np.array([imu_data.accelerometer.x, imu_data.accelerometer.y, imu_data.accelerometer.z]) * ACC_SCALE
-        acc_corrected = accel - GRAVITY
+            spectator.set_transform(carla.Transform(smoothed_loc, cam_rotation))
+            time.sleep(0.05)
 
-        # --- Threshold low noise values ---
-        acc_corrected[np.abs(acc_corrected) < ACC_NOISE_THRESH] = 0.0
+    threading.Thread(target=follow_vehicle, daemon=True).start()
 
-        # --- Integrate acceleration to velocity ---
-        imu_velocity += acc_corrected * dt
-
-        # --- ZUPT: if acceleration is tiny for a few frames, assume stationary ---
-        if np.linalg.norm(acc_corrected) < ACC_NOISE_THRESH:
-            stationary_counter += 1
-            if stationary_counter >= ZUPT_COUNT_THRESH:
-                imu_velocity[:] = 0.0
-        else:
-            stationary_counter = 0
-
-        # --- Clamp velocity (sanity) ---
-        imu_velocity = np.clip(imu_velocity, -MAX_VELOCITY, MAX_VELOCITY)
-
-        # --- Integrate velocity to position ---
-        imu_position += imu_velocity * dt
-
-        # --- Store & log ---
-        imu_trajectory.append((imu_position[0], imu_position[1], imu_position[2]))
-
-        print(f"[IMU] Accel: {acc_corrected.round(2)}, Vel: {imu_velocity.round(2)}, dt: {dt:.4f}")
-        print(f"[IMU] Position: ({imu_position[1]:.2f}, {imu_position[0]:.2f}, {imu_position[2]:.2f}) m")
-
-
-    imu_sensor.listen(imu_cb)
-    time.sleep(1)
     vehicle.set_autopilot(True)
 
+
+    tm = client.get_trafficmanager()
+    tm.ignore_lights_percentage(vehicle, 100.0)
+    tm.ignore_signs_percentage(vehicle, 100.0)
+    tm.ignore_vehicles_percentage(vehicle, 100.0)
+    tm.set_global_distance_to_leading_vehicle(5.0)
+    tm.set_synchronous_mode(False)
 
     latest_lidar = {'points': None}
     latest_radar = {'points': []}
@@ -177,7 +151,7 @@ def carla_slam_loop():
     camera_bp.set_attribute("image_size_x", "800")
     camera_bp.set_attribute("image_size_y", "600")
     camera_bp.set_attribute("fov", "90")
-    camera_bp.set_attribute("sensor_tick", "0.1")
+    camera_bp.set_attribute("sensor_tick", "0.05")
     camera_bp.set_attribute("enable_postprocess_effects", "True")
 
 
@@ -208,14 +182,26 @@ def carla_slam_loop():
                     pc.colors = o3d.utility.Vector3dVector(np.vstack(colors))
                     o3d.io.write_point_cloud("output/slam_map_colored.ply", pc)
 
+                # Save IMU trajectory in black
+                if len(imu_trajectory) > 0:
+                    imu_pc = o3d.geometry.PointCloud()
+                    imu_pc.points = o3d.utility.Vector3dVector(np.array(imu_trajectory))
+                    imu_pc.colors = o3d.utility.Vector3dVector(
+                        np.tile([0.0, 0.0, 0.0], (len(imu_trajectory), 1)))  # Black
+                    o3d.io.write_point_cloud("output/imu_trajectory.ply", imu_pc)
 
                 # Save trajectory
-                if len(trajectory) > 0:
-                    traj_pc = o3d.geometry.PointCloud()
-                    traj_pc.points = o3d.utility.Vector3dVector(np.array(trajectory))
-                    o3d.io.write_point_cloud("output/slam_trajectory.ply", traj_pc)
+                # if len(trajectory) > 0:
+                #     traj_pc = o3d.geometry.PointCloud()
+                #     traj_pc.points = o3d.utility.Vector3dVector(np.array(trajectory))
+                #     o3d.io.write_point_cloud("output/slam_trajectory.ply", traj_pc)
 
-                print("💾 Map + trajectory saved to /output/")
+                print("Map + trajectory saved to /output/")
+                np.save("output/lidar.npy", np.array(lidar_map_points))
+                np.save("output/radar.npy", np.array(radar_map_points))
+                np.save("output/trajectory.npy", np.array(trajectory))
+                np.save("output/imu_trajectory.npy", np.array(imu_trajectory))
+
             except Exception as e:
                 print(f"Error saving map: {e}")
 
@@ -263,13 +249,24 @@ def carla_slam_loop():
             transform = vehicle.get_transform()
             location = transform.location
             rotation = transform.rotation
-            trajectory.append((location.x, location.y, location.z))
-
+            # trajectory.append((location.x, location.y, location.z))
             yaw = np.radians(rotation.yaw)
             c, s = np.cos(yaw), np.sin(yaw)
             R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
             t = np.array([location.x, location.y, location.z])
             latest_radar['points'] = []
+            transform = vehicle.get_transform()
+            true_location = transform.location
+
+            # Add Gaussian noise to simulate IMU drift
+            noisy_location = carla.Location(
+                x=true_location.x + np.random.normal(0, pos_noise_std),
+                y=true_location.y + np.random.normal(0, pos_noise_std),
+                z=true_location.z + np.random.normal(0, 0.02),
+            )
+
+            # Append to simulated IMU trajectory
+            imu_trajectory.append((noisy_location.x, noisy_location.y, noisy_location.z))
 
             time.sleep(0.05)
             points = latest_lidar['points']
@@ -292,5 +289,4 @@ def carla_slam_loop():
         radar1.listen(radar_cb)
         radar2.listen(radar_cb)
         radar3.listen(radar_cb)
-        imu_sensor.stop()
         vehicle.destroy()
