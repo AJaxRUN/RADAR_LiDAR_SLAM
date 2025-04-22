@@ -1,0 +1,47 @@
+import torch
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+from pointnet_completion import PointNetCompletion, chamfer_distance
+
+class RadarLidarDataset(Dataset):
+    def __init__(self, dataset_dir="dataset", max_samples=1000):
+        self.radar_files = [f"dataset/radar_{i}.npy" for i in range(max_samples) if os.path.exists(f"dataset/radar_{i}.npy")]
+        self.lidar_files = [f"dataset/lidar_{i}.npy" for i in range(max_samples) if os.path.exists(f"dataset/lidar_{i}.npy")]
+        assert len(self.radar_files) == len(self.lidar_files), "Mismatched radar and LiDAR files"
+
+    def __len__(self):
+        return len(self.radar_files)
+
+    def __getitem__(self, idx):
+        radar = np.load(self.radar_files[idx]).astype(np.float32)
+        lidar = np.load(self.lidar_files[idx]).astype(np.float32)
+        return radar, lidar
+
+def train_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = PointNetCompletion(input_points=256, output_points=2048).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    dataset = RadarLidarDataset()
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    num_epochs = 200
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for radar, lidar in dataloader:
+            radar, lidar = radar.to(device), lidar.to(device)
+            optimizer.zero_grad()
+            pred = model(radar)
+            loss = chamfer_distance(pred, lidar)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(dataloader)}")
+
+    # Save the trained model
+    torch.save(model.state_dict(), "pointnet_completion.pth")
+
+if __name__ == "__main__":
+    train_model()
